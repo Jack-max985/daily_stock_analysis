@@ -66,13 +66,13 @@ class FeishuSender:
         # 检查字节长度，超长则分批发送
         content_bytes = len(formatted_content.encode('utf-8'))
         if content_bytes > max_bytes:
-            logger.info(f"飞书消息内容超长({content_bytes}字节/{len(content)}字符)，将分批发送")
+            logger.info(f"飞书消息内容超长 ({content_bytes}字节/{len(content)}字符)，将分批发送")
             return self._send_feishu_chunked(formatted_content, max_bytes)
         
         try:
             return self._send_feishu_message(formatted_content)
         except Exception as e:
-            logger.error(f"发送飞书消息失败: {e}")
+            logger.error(f"发送飞书消息失败：{e}")
             return False
    
     def _send_feishu_chunked(self, content: str, max_bytes: int) -> bool:
@@ -104,7 +104,7 @@ class FeishuSender:
                 else:
                     logger.error(f"飞书第 {i+1}/{total_chunks} 批发送失败")
             except Exception as e:
-                logger.error(f"飞书第 {i+1}/{total_chunks} 批发送异常: {e}")
+                logger.error(f"飞书第 {i+1}/{total_chunks} 批发送异常：{e}")
             
             # 批次间隔，避免触发频率限制
             if i < total_chunks - 1:
@@ -113,10 +113,13 @@ class FeishuSender:
         return success_count == total_chunks
     
     def _send_feishu_message(self, content: str) -> bool:
-        """发送单条飞书消息（优先使用 Markdown 卡片）"""
+        """发送单条飞书消息（带重试机制，优先使用 Markdown 卡片）"""
+        max_retries = 3
+        base_retry_delay = 2  # 秒
+        
         def _post_payload(payload: Dict[str, Any]) -> bool:
             logger.debug(f"飞书请求 URL: {self._feishu_url}")
-            logger.debug(f"飞书请求 payload 长度: {len(content)} 字符")
+            logger.debug(f"飞书请求 payload 长度：{len(content)} 字符")
 
             response = requests.post(
                 self._feishu_url,
@@ -125,8 +128,8 @@ class FeishuSender:
                 verify=self._webhook_verify_ssl
             )
 
-            logger.debug(f"飞书响应状态码: {response.status_code}")
-            logger.debug(f"飞书响应内容: {response.text}")
+            logger.debug(f"飞书响应状态码：{response.status_code}")
+            logger.debug(f"飞书响应内容：{response.text}")
 
             if response.status_code == 200:
                 result = response.json()
@@ -138,14 +141,14 @@ class FeishuSender:
                     error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
                     error_code = result.get('code') or result.get('StatusCode', 'N/A')
                     logger.error(f"飞书返回错误 [code={error_code}]: {error_msg}")
-                    logger.error(f"完整响应: {result}")
+                    logger.error(f"完整响应：{result}")
                     return False
             else:
-                logger.error(f"飞书请求失败: HTTP {response.status_code}")
-                logger.error(f"响应内容: {response.text}")
+                logger.error(f"飞书请求失败：HTTP {response.status_code}")
+                logger.error(f"响应内容：{response.text}")
                 return False
 
-        # 1) 优先使用交互卡片（支持 Markdown 渲染）
+        # 1) 优先使用交互卡片（支持 Markdown 渲染），带重试
         card_payload = {
             "msg_type": "interactive",
             "card": {
@@ -153,7 +156,7 @@ class FeishuSender:
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": "A股智能分析报告"
+                        "content": "A 股智能分析报告"
                     }
                 },
                 "elements": [
@@ -168,10 +171,47 @@ class FeishuSender:
             }
         }
 
-        if _post_payload(card_payload):
-            return True
+        # 尝试发送卡片消息，失败时重试
+        for attempt in range(max_retries):
+            try:
+                if _post_payload(card_payload):
+                    return True
+                else:
+                    # 飞书返回业务错误，可能是卡片格式问题，直接降级到文本消息
+                    logger.warning(f"飞书卡片消息业务失败，将降级到文本消息")
+                    break
+            except requests.exceptions.SSLError as e:
+                logger.warning(f"飞书 SSL 错误（第{attempt+1}/{max_retries}次尝试）: {e}")
+                if attempt < max_retries - 1:
+                    # 指数退避：2s, 4s, 8s
+                    sleep_time = base_retry_delay * (2 ** attempt)
+                    logger.info(f"等待 {sleep_time} 秒后重试...")
+                    time.sleep(sleep_time)
+                continue
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"飞书请求超时（第{attempt+1}/{max_retries}次尝试）: {e}")
+                if attempt < max_retries - 1:
+                    sleep_time = base_retry_delay * (2 ** attempt)
+                    logger.info(f"等待 {sleep_time} 秒后重试...")
+                    time.sleep(sleep_time)
+                continue
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"飞书连接错误（第{attempt+1}/{max_retries}次尝试）: {e}")
+                if attempt < max_retries - 1:
+                    sleep_time = base_retry_delay * (2 ** attempt)
+                    logger.info(f"等待 {sleep_time} 秒后重试...")
+                    time.sleep(sleep_time)
+                continue
+            except requests.exceptions.RequestException as e:
+                logger.error(f"飞书网络异常：{e}")
+                # 其他网络错误，不重试
+                break
+            except Exception as e:
+                logger.error(f"飞书发送异常：{e}")
+                # 未知异常，不重试
+                break
 
-        # 2) 回退为普通文本消息
+        # 2) 卡片消息失败或降级，回退为普通文本消息（同样带重试）
         text_payload = {
             "msg_type": "text",
             "content": {
@@ -179,4 +219,40 @@ class FeishuSender:
             }
         }
 
-        return _post_payload(text_payload)
+        for attempt in range(max_retries):
+            try:
+                if _post_payload(text_payload):
+                    logger.info("飞书文本消息发送成功（降级模式）")
+                    return True
+                else:
+                    logger.error(f"飞书文本消息业务失败")
+                    return False
+            except requests.exceptions.SSLError as e:
+                logger.warning(f"飞书 SSL 错误（文本消息，第{attempt+1}/{max_retries}次尝试）: {e}")
+                if attempt < max_retries - 1:
+                    sleep_time = base_retry_delay * (2 ** attempt)
+                    logger.info(f"等待 {sleep_time} 秒后重试...")
+                    time.sleep(sleep_time)
+                continue
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"飞书请求超时（文本消息，第{attempt+1}/{max_retries}次尝试）: {e}")
+                if attempt < max_retries - 1:
+                    sleep_time = base_retry_delay * (2 ** attempt)
+                    logger.info(f"等待 {sleep_time} 秒后重试...")
+                    time.sleep(sleep_time)
+                continue
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"飞书连接错误（文本消息，第{attempt+1}/{max_retries}次尝试）: {e}")
+                if attempt < max_retries - 1:
+                    sleep_time = base_retry_delay * (2 ** attempt)
+                    logger.info(f"等待 {sleep_time} 秒后重试...")
+                    time.sleep(sleep_time)
+                continue
+            except requests.exceptions.RequestException as e:
+                logger.error(f"飞书网络异常（文本消息）: {e}")
+                return False
+            except Exception as e:
+                logger.error(f"飞书发送异常（文本消息）: {e}")
+                return False
+
+        return False
